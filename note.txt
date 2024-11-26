@@ -1,0 +1,17 @@
+Allocating interactive resources
+
+# salloc --time=1:0:0 --mem-per-cpu=3G --ntasks=1 --account=def-kgroling --gpus-per-node=1
+
+check running jobs
+#squeue -u $USER
+# cancel all user jobs
+# scancel -u $USER or scancel #jobid
+
+Task
+ - Visualize the prototype distribution (heatmap of prototypes class label count): Globally; client and prototype heatmap.(priority!) 
+ - Using Resnet!
+ - Train a bit longer before starting the prototype sharing.
+ - # normalize the protos (L2 - norm) - insted of relu; and use the cosine similarity to find closer protoype or dot product.
+ - Think about ways to initialize the global prototypes (Eg. running the client learn for couple of rounds and collecting prototypes)
+
+

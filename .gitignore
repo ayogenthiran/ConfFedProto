@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+fedproto_env/
+venv/
+
+# Data and Results
+datasets/
+results/
+plots/
+protos/
+*.pkl
+
+# System
+.DS_Store
