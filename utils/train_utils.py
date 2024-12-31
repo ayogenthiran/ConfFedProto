@@ -65,8 +65,9 @@ def train(args, net, trainloader, global_round, _client, global_proto=None):
     """
     net.train()
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum)
-    
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+
     for epoch in range(args.epoch):
         
         correct, total, epoch_loss = 0, 0, 0.0
@@ -78,13 +79,18 @@ def train(args, net, trainloader, global_round, _client, global_proto=None):
             images, labels = batch["image"], batch["label"]
             images, labels = images.to(args.device), labels.to(args.device)
 
-
             optimizer.zero_grad()
             outputs, proto = net(images)
 
             # loss is the sum of the classification loss and the prototype loss
             loss1 = criterion(outputs, labels)
-            
+
+            if args.conffedproto:
+                # Compute confidence and predicted classes in one step
+                probabilities = F.softmax(outputs, dim=1)
+                confidence_scores = probabilities[range(labels.size(0)), labels] #confidence_scores = torch.max(probabilities, dim=1).values
+                proto = confidence_scores.unsqueeze(1) * proto
+                
             # Initialize loss2 to zero
             loss2 = 0 * loss1
             
@@ -99,7 +105,7 @@ def train(args, net, trainloader, global_round, _client, global_proto=None):
             
             loss.backward()
             optimizer.step()
-
+        
             # collect client prototypes on the last epoch only to save computation time.
             if epoch == args.epoch - 1:
                 if args.fedproto and not args.pfl:
@@ -116,6 +122,8 @@ def train(args, net, trainloader, global_round, _client, global_proto=None):
 
         epoch_loss /= len(trainloader.dataset)
         epoch_acc = correct / total
+
+        #scheduler.step()
 
            
         if args.clog:
@@ -276,38 +284,16 @@ def running_model_avg(current, next, scale):
     return current
 
 
-def model_fedavg(client_models, globalmodel, round_clients):
-    """
-    Averages the weights of the client models to update the global model.
+def server_aggregate_avg(global_model, client_models, selected_clients):
+    global_dict = global_model.state_dict()
     
-    Args:
-        client_models (list): List of client models.
-        globalmodel (torch.nn.Module): The global model to be updated.
-        round_clients (list): List of indices of client models to average.
-
-    Returns:
-        torch.nn.Module: The updated global model.
-    """
-    # Get the state_dict of the global model
-    global_state_dict = globalmodel.state_dict()
-
-    # Initialize an empty state_dict for averaging
-    avg_state_dict = {key: torch.zeros_like(value) for key, value in global_state_dict.items()}
-
-    # Count the number of clients contributing
-    num_clients = len(round_clients)
-
-    # Iterate over the selected client models and add their weights
-    for client_idx in round_clients:
-        client_state_dict = client_models[client_idx].state_dict()
-        for key in avg_state_dict:
-            avg_state_dict[key] += client_state_dict[key]
-
-    # Average the weights
-    for key in avg_state_dict:
-        avg_state_dict[key] /= num_clients
-
-    # Load the averaged weights into the global model
-    globalmodel.load_state_dict(avg_state_dict)
-
-    return globalmodel
+    for k in global_dict.keys():
+        # Average the parameters from all selected clients
+        global_dict[k] = sum(
+            client_models[i].state_dict()[k].float()
+            for i in selected_clients
+        ) / len(selected_clients)
+    
+    # Update the global model with the aggregated parameters
+    return global_dict
+    
