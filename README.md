@@ -1,4 +1,4 @@
-# ConFedProto: Federated Learning with Prototypes
+# ConFedProto: Adaptive Confidence Based Prototype Aggregation for Federated Prototype Learning on Non-IID Data
 
 This repository implements FedProto, a novel federated learning approach that uses prototype learning to handle heterogeneous clients. The implementation supports both MNIST and CIFAR10 datasets and compares FedProto with standard Federated Learning.
 
