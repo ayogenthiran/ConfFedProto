@@ -1,4 +1,3 @@
-
 import torch
 
 from collections import OrderedDict
@@ -296,4 +295,3 @@ def server_aggregate_avg(global_model, client_models, selected_clients):
     
     # Update the global model with the aggregated parameters
     return global_dict
-    
