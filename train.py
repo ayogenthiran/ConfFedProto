@@ -1,171 +1,165 @@
+import os
+import copy
+import argparse
+import logging
+import random
+import pickle
+
+#torch
 import torch
-import numpy as np
-from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
-import matplotlib.pyplot as plt
-import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torchvision import transforms
 
-def train(args, net, trainloader, global_round, _client, global_proto=None):
-    net.train()
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(
-        net.parameters(),
-        lr=args.lr * (0.99 ** global_round),
-        momentum=args.momentum,
-        weight_decay=1e-4
-    )
-    scheduler = torch.optim.CosineAnnealingLR(optimizer, T_max=args.epoch)
-    scaler = GradScaler() if args.device == 'cuda' else None
-    client_protos = {}
+#utils
+from utils.data_utils import *
+from utils.train_utils import *
+from utils.model import *
+from utils.args_util import *
+
+
+def main(args):
+    # collect args
+    #args = parse_arguments()
+    print_argsinfo(args)
+    # global model
+    path = f"models/{args.data}_init_global_model.pth"
+    match args.data:
+        case "mnist":
+            global_model = MnistNet().to(args.device)
+        case "cifar10":
+            global_model = Cifar10Net().to(args.device)
+        case "emnist":
+            global_model = EMNISTNet().to(args.device)
+        case _:
+            raise ValueError(f"Unknown data: {args.data}")
+
+    if os.path.exists(path):
+        global_model.load_state_dict(torch.load(path, weights_only=True))
+    else:
+        torch.save(global_model.state_dict(), path)
     
-    for epoch in range(args.epoch):
-        correct, total, epoch_loss = 0, 0, 0.0
-        
-        for batch_idx, batch in enumerate(trainloader):
-            try:
-                images, labels = batch["image"].to(args.device), batch["label"].to(args.device)
-                optimizer.zero_grad(set_to_none=True)
+    total_params = sum(p.numel() for p in global_model.parameters())
+    
+    # initalize client models with global model
+    clients = [copy.deepcopy(global_model).to(args.device) for _ in range(args.clients)]
+    
+    # initialize global  prototype
+    torch.manual_seed(args.seed )
+    global_proto = {}  # Shape: [k, 120] 
 
-                if scaler:
-                    with autocast():
-                        outputs, proto = net(images)
-                        loss1 = criterion(outputs, labels)
-                        loss2 = computeProtoLoss(args, proto, global_proto, labels, loss1) if args.fedproto else 0
-                        alpha = global_round/args.round
-                        loss = loss1 + (alpha * args.ld * loss2)
-                    
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs, proto = net(images)
-                    loss1 = criterion(outputs, labels)
-                    loss2 = computeProtoLoss(args, proto, global_proto, labels, loss1) if args.fedproto else 0
-                    alpha = global_round/args.round
-                    loss = loss1 + (alpha * args.ld * loss2)
-                    loss.backward()
-                    optimizer.step()
+    # loader train_loader, testloader = load_dataset(args, _client)
+    train_loader = [] 
+    testloader = []
+    for _client in range(args.clients):
+        #print(f"Loading data of client: {_client} ")
+        _train_loader, _test_loader = load_dataset(args, _client)
+        train_loader.append(_train_loader)
+        testloader.append(_test_loader)
+    # train FL
+    for _round in range(args.round):
 
-                if epoch == args.epoch - 1 and args.fedproto:
-                    for i, label in enumerate(labels):
-                        label_item = label.item()
-                        if label_item in client_protos:
-                            client_protos[label_item].append(proto[i].detach().cpu())
-                        else:
-                            client_protos[label_item] = [proto[i].detach().cpu()]
-
-                epoch_loss += loss.item()
-                total += labels.size(0)
-                correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
-
-                if batch_idx % 50 == 0 and args.clog:
-                    print(f"Epoch {epoch}, Batch {batch_idx}: Loss = {loss.item():.4f}")
-
-            except Exception as e:
-                print(f"Error in batch {batch_idx}: {str(e)}")
-                continue
-
-        scheduler.step()
-        epoch_acc = correct / total
-        epoch_loss = epoch_loss / len(trainloader.dataset)
+        # inialize round client prototypes.
+        # Store client prototypes after training.
+        client_protos = {}
+        # select csplit clients randomly
+        random.seed(args.seed)
+        round_clients = random.sample(range(len(clients)), int(args.clients*args.clsplit))
 
         if args.clog:
-            print(f"Epoch {epoch+1}: loss {epoch_loss:.4f}, accuracy {epoch_acc:.4f}")
-
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
-
-    # Average client prototypes
-    if args.fedproto:
-        for key in client_protos:
-            client_protos[key] = torch.stack(client_protos[key]).mean(dim=0)
-        return net, client_protos, epoch_acc, epoch_loss
+            print(f"Round {_round} selected clients: {round_clients}")
     
-    return net, epoch_acc, epoch_loss
+        # collect client test accuracies
+        client_test_acc = 0
+        client_test_loss = 0
 
-def test(args, net, testloader):
-    criterion = torch.nn.CrossEntropyLoss()
-    correct, total, loss = 0, 0, 0.0
-    net.eval()
-    
-    protos_list = []
-    labels_list = []
-    
-    with torch.no_grad():
-        for batch in testloader:
-            try:
-                images = batch["image"].to(args.device)
-                labels = batch["label"].to(args.device)
+        # collect client train accuracies
+        client_train_acc = 0
+        client_train_loss = 0
+        
+        # train the selected clients
+        for _client in round_clients:
+            
+            if args.clog:
+                print(f"Training client {_client}")
+            
+            if not args.fedproto:
+                _client_model = clients[_client]
+                _client_model.load_state_dict(global_model.state_dict())
+            # check if the global model is correctly set to client model
+            if not args.fedproto:
+                if not are_models_equal(_client_model, global_model):
+                    raise ValueError("Global model is not correctly set to client model")
+        
+            # train the client model
+            if args.fedproto:
+                # train the client model with fedproto
+                _client_model_trained, protos, _accc, _losss = train(args, clients[_client], train_loader[_client], _round, _client, global_proto)
+                clients[_client] = _client_model_trained
                 
-                outputs, protos = net(images)
-                protos_list.append(protos)
-                labels_list.append(labels)
+                # collect train and test loss and accuracy
+                _ts_loss, _ts_acc, test_protos, test_labels = test(args, _client_model_trained, testloader[_client])
+                _tr_loss, _tr_acc, _, _ = test(args, _client_model_trained, train_loader[_client])
                 
-                loss += criterion(outputs, labels).item()
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-                
-            except Exception as e:
-                print(f"Error during testing: {str(e)}")
-                continue
-    
-    if total == 0:
-        return float('inf'), 0, None, None
-    
-    test_protos = torch.cat(protos_list, dim=0) if protos_list else None
-    test_labels = torch.cat(labels_list, dim=0) if labels_list else None
-    
-    return loss/total, correct/total, test_protos, test_labels
+                if args.clog:
+                    # save client test protos and labels
+                    with open(f"/scratch/joet/fedproto/protos/{args.data}_client_ufedp_{_client}_proto_round_{_round}.pkl", "wb") as f:
+                        pickle.dump(test_protos, f)
 
-def computeProtoLoss(args, proto, global_proto, labels, loss1):
-    if not global_proto:
-        return 0
-    
-    loss_mse = torch.nn.MSELoss().to(args.device)
-    batch_global_proto = []
-    
-    try:
-        for label in labels:
-            label_item = label.item()
-            if label_item in global_proto:
-                batch_global_proto.append(global_proto[label_item])
+                    with open(f"/scratch/joet/fedproto/protos/{args.data}_client_ufedp_{_client}_labels_round_{_round}.pkl", "wb") as f:
+                        pickle.dump(test_labels, f)
+
+                client_test_acc += _ts_acc
+                client_test_loss += _ts_loss
+
+                client_train_acc += _tr_acc
+                client_train_loss += _tr_loss
+                
+                # collect client prototypes
+                for key in protos.keys():
+                    if key in client_protos.keys():
+                        client_protos[key].append(protos[key])
+                    else:
+                        client_protos[key] = [protos[key]]
             else:
-                batch_global_proto.append(torch.zeros_like(proto[0]))
+                _client_model_trained, tr_acc, tr_loss = train(args, _client_model, train_loader[_client],_round, global_proto)
+                clients[_client] = _client_model_trained
+                # Running average of the models
+                # if not args.fedproto:
+                #     global_model = running_model_avg(global_model, clients, round_clients)
         
-        batch_global_proto = torch.stack(batch_global_proto).to(args.device)
-        return loss_mse(proto, batch_global_proto)
-    
-    except Exception as e:
-        print(f"Error computing proto loss: {str(e)}")
-        return 0
+        
+        # average the client prototypes and update the global prototype
+        if args.fedproto:
+            for key in client_protos.keys():
+                global_proto[key] = torch.stack(client_protos[key]).mean(dim=0)
+        else:
+            # compute the global model
+            global_dict = server_aggregate_avg(global_model, clients, round_clients)
+            global_model.load_state_dict(global_dict)
+        
+        if args.clog:
+            # save prototype to a file
+            with open(f"protos/global_proto_{_round}.pkl", "wb") as f:
+                pickle.dump(global_proto, f)
 
-def model_fedavg(client_models, globalmodel, round_clients):
-    try:
-        global_state = globalmodel.state_dict()
-        avg_state = {key: torch.zeros_like(value) for key, value in global_state.items()}
-        
-        for client_idx in round_clients:
-            client_state = client_models[client_idx].state_dict()
-            for key in avg_state:
-                avg_state[key] += client_state[key]
-        
-        for key in avg_state:
-            avg_state[key] = torch.div(avg_state[key], len(round_clients))
-        
-        globalmodel.load_state_dict(avg_state)
-        return globalmodel
-    
-    except Exception as e:
-        print(f"Error in model averaging: {str(e)}")
-        return globalmodel
+        if args.fedproto or args.pfl:
+            print(f"[PFL] Global round: {_round+1}, Train loss: {client_train_loss/len(round_clients):.4f}, Test loss: {client_test_loss/len(round_clients):.4f}, Train accuracy: {client_train_acc/len(round_clients):.4f}, Test accuracy: {client_test_acc/len(round_clients):.4f}")
+        else:
+            #global_model.load_state_dict(running_avg)
+            _loss, _acc, _, _ = test(args, global_model, testloader[_client])
 
-def get_parameters(net) -> List[np.ndarray]:
-    return [val.cpu().numpy() for _, val in net.state_dict().items()]
+            print(f"[RFL]Global round R-FL {_round+1} loss: {_loss}, accuracy: {_acc}")
 
-def set_parameters(net, parameters: List[np.ndarray]):
-    params_dict = zip(net.state_dict().keys(), parameters)
-    state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
-    return net
+        # # save the global prototype
+        # with open(f"/scratch/joet/fedproto/protos/{args.data}_global_proto_{_round}.pkl", "wb") as f:
+        #     pickle.dump(global_proto, f)
+
+
+
+if __name__ == "__main__":
+    args = parse_arguments()  # default args.
+    #print_argsinfo(args)
+    #print(configurations)
+    main(args)
+    # for config in configurations:
+    #     args = argparse.Namespace(**config)
+    #     main(args)
