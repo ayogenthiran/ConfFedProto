@@ -1,3 +1,4 @@
+
 import torch
 
 from collections import OrderedDict
@@ -84,7 +85,7 @@ def train(args, net, trainloader, global_round, _client, global_proto=None):
             # loss is the sum of the classification loss and the prototype loss
             loss1 = criterion(outputs, labels)
 
-            if args.conffedproto:
+            if args.conffedproto:   ### The confidence score should be the confidence of that label
                 # Compute confidence and predicted classes in one step
                 probabilities = F.softmax(outputs, dim=1)
                 confidence_scores = probabilities[range(labels.size(0)), labels] #confidence_scores = torch.max(probabilities, dim=1).values
@@ -295,3 +296,4 @@ def server_aggregate_avg(global_model, client_models, selected_clients):
     
     # Update the global model with the aggregated parameters
     return global_dict
+    
